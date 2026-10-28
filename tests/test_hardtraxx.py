@@ -79,6 +79,13 @@ class TestExtractReleaseDate:
         row = soup.select_one(".htx-topic-row")
         assert scraper._extract_release_date(row) is None
 
+    def test_malformed_date_returns_none(self, scraper):
+        # 2026-02-30 looks well-formed but is an invalid calendar date;
+        # strptime raises ValueError and must be handled gracefully.
+        soup = rows_soup(make_row("Artist - Title", "2026-02-30"))
+        row = soup.select_one(".htx-topic-row")
+        assert scraper._extract_release_date(row) is None
+
 
 class TestExtractGenre:
     def test_hardstyle(self, scraper):
@@ -104,9 +111,12 @@ class TestExtractTracks:
             make_row("Demi Kanon & Caelum - Paralyzed", "2026-10-02"),
             make_row("Frontliner - Running, Running Running (Edit)", "2026-09-26"),
         )
-        tracks = scraper._extract_tracks_out_of_list(soup.select(".htx-topic-row"))
+        tracks, reached_cutoff = scraper._extract_tracks_out_of_list(
+            soup.select(".htx-topic-row")
+        )
 
         assert len(tracks) == 2
+        assert reached_cutoff is False
         by_title = {t.title: t for t in tracks}
 
         paralyzed = by_title["Paralyzed"]
@@ -123,17 +133,21 @@ class TestExtractTracks:
             make_row("A - New Track", "2026-10-02"),
             make_row("B - Old Track", "2026-09-24"),
         )
-        tracks = scraper._extract_tracks_out_of_list(soup.select(".htx-topic-row"))
+        tracks, reached_cutoff = scraper._extract_tracks_out_of_list(
+            soup.select(".htx-topic-row")
+        )
 
         assert [t.title for t in tracks] == ["New Track"]
+        assert reached_cutoff is True
 
     def test_skips_rows_without_title_link(self, scraper):
         soup = rows_soup(make_row("A - B", "2026-10-01"))
         extra = BeautifulSoup("<dl class=\"htx-topic-row\"></dl>", "html.parser")
         rows = soup.select(".htx-topic-row") + extra.select("dl")
 
-        tracks = scraper._extract_tracks_out_of_list(rows)
+        tracks, reached_cutoff = scraper._extract_tracks_out_of_list(rows)
         assert len(tracks) == 1
+        assert reached_cutoff is False
 
 
 class TestFetchTracks:
@@ -198,6 +212,76 @@ class TestFetchTracks:
             tracks = scraper.fetch_tracks()
 
         assert len(tracks) == 1
+
+    def test_fetch_tracks_continues_past_malformed_rows(self, scraper):
+        page1 = (
+            '<!DOCTYPE html><html><body>'
+            + '<dl class="htx-topic-row"><dd>broken row</dd></dl>'
+            + make_row("A - Track One", "2026-10-02")
+            + "</body></html>"
+        )
+        page2 = (
+            '<!DOCTYPE html><html><body>'
+            + make_row("B - Track Two", "2026-09-30")
+            + "</body></html>"
+        )
+        page3 = "<html><body></body></html>"
+
+        with patch(
+            "scraper.hardtraxx.web_request",
+            side_effect=[
+                self._fake_response(page1),
+                self._fake_response(page2),
+                self._fake_response(page3),
+            ],
+        ) as mock_req, patch("scraper.hardtraxx.time.sleep"):
+            tracks = scraper.fetch_tracks()
+
+        titles = sorted(t.title for t in tracks)
+        assert titles == ["Track One", "Track Two"]
+        # A malformed row on page 1 must not stop pagination
+        assert mock_req.call_count == 3
+
+    def test_fetch_tracks_fetches_more_than_two_pages(self, scraper):
+        pages = []
+        for number, date_iso in enumerate(
+            ["2026-10-02", "2026-09-30", "2026-09-28"], start=1
+        ):
+            pages.append(
+                '<!DOCTYPE html><html><body>'
+                + make_row(f"Artist {number} - Track {number}", date_iso)
+                + "</body></html>"
+            )
+        pages.append("<html><body></body></html>")
+
+        with patch(
+            "scraper.hardtraxx.web_request",
+            side_effect=[self._fake_response(page) for page in pages],
+        ) as mock_req, patch("scraper.hardtraxx.time.sleep"):
+            tracks = scraper.fetch_tracks()
+
+        titles = sorted(t.title for t in tracks)
+        assert titles == ["Track 1", "Track 2", "Track 3"]
+        assert mock_req.call_count == 4
+
+    def test_fetch_tracks_stops_at_max_pages_override(self):
+        scraper = HardTraxx(from_date=datetime(2026, 9, 25))
+        scraper.MAX_PAGES = 1
+
+        page1 = (
+            '<!DOCTYPE html><html><body>'
+            + make_row("A - Track One", "2026-10-02")
+            + "</body></html>"
+        )
+
+        with patch(
+            "scraper.hardtraxx.web_request",
+            side_effect=[self._fake_response(page1), self._fake_response(page1)],
+        ) as mock_req, patch("scraper.hardtraxx.time.sleep"):
+            tracks = scraper.fetch_tracks()
+
+        assert [t.title for t in tracks] == ["Track One"]
+        assert mock_req.call_count == 1
 
     def test_fetch_tracks_wraps_request_errors(self, scraper):
         with patch(

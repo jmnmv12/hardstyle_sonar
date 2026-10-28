@@ -1,9 +1,10 @@
+import itertools
 import logging
 import time
 
 from bs4 import BeautifulSoup
 from scraper import BaseScraper
-from typing import List
+from typing import List, Optional, Tuple
 from scraper.models import TrackData
 from scraper.models.track_data import Genre
 from datetime import datetime
@@ -24,7 +25,9 @@ class HardTraxx(BaseScraper):
     BASE_URL = "https://hardtraxx.com/tracks/"
     QUERY = "?tab=released&sort=date"
     TOPICS_PER_PAGE = 30
-    MAX_PAGES = 2
+    # Optional hard cap on the number of pages fetched. None means keep
+    # paging until the from_date cutoff or an empty page is reached.
+    MAX_PAGES: Optional[int] = None
 
     GENRE_MAP = {
         "hardstyle": Genre.Hardstyle,
@@ -65,12 +68,26 @@ class HardTraxx(BaseScraper):
         for time_el in candidates:
             raw = (time_el.get("datetime") or "").strip()
             if len(raw) == 10:
-                return datetime.strptime(raw, "%Y-%m-%d")
+                try:
+                    return datetime.strptime(raw, "%Y-%m-%d")
+                except ValueError:
+                    # Malformed date (e.g. "2026-02-30"): treat it as
+                    # missing so a single bad row cannot abort the scrape.
+                    return None
 
         return None
 
-    def _extract_tracks_out_of_list(self, track_soup):
+    def _extract_tracks_out_of_list(self, track_soup) -> Tuple[List[TrackData], bool]:
+        """
+        Parse track rows out of a listing page.
+
+        Returns ``(tracks, reached_cutoff)``. ``reached_cutoff`` is True only
+        when a parsed row's release date is older than ``from_date``; rows
+        skipped for other reasons (no title link, missing or malformed date)
+        do not set it, so they can never stop pagination prematurely.
+        """
         track_data = []
+        reached_cutoff = False
 
         for track in track_soup:
             link = track.select_one("a.topictitle")
@@ -81,12 +98,16 @@ class HardTraxx(BaseScraper):
             release_date = self._extract_release_date(track)
             if release_date is None:
                 logger.warning(
-                    f"Skipping track without release date: {link.get_text(strip=True)}"
+                    "Skipping track without release date: %s",
+                    link.get_text(strip=True),
                 )
                 continue
 
-            # 2. Exclude track if it's before the from_date
+            # 2. Exclude track if it's before the from_date. The listing is
+            #    sorted newest first, so an old row means the date window
+            #    has ended; deeper pages only contain older tracks.
             if self._before_from_date(release_date):
+                reached_cutoff = True
                 continue
 
             # 3. Extract track details
@@ -99,12 +120,14 @@ class HardTraxx(BaseScraper):
             track_object.genre = self._extract_genre(track)
 
             logger.info(
-                f"Retrieved track: {track_object.artist_name} - "
-                f"{track_object.title}, {track_object.release_date}"
+                "Retrieved track: %s - %s, %s",
+                track_object.artist_name,
+                track_object.title,
+                track_object.release_date,
             )
             track_data.append(track_object)
 
-        return track_data
+        return track_data, reached_cutoff
 
     def _build_page_url(self, page: int) -> str:
         if page == 0:
@@ -116,36 +139,42 @@ class HardTraxx(BaseScraper):
         track_data = []
 
         logger.info("Fetching tracks...")
-        for page in range(self.MAX_PAGES):
+        for page in itertools.count():
+            if self.MAX_PAGES is not None and page >= self.MAX_PAGES:
+                logger.warning("Reached MAX_PAGES limit (%d). Stopping.", self.MAX_PAGES)
+                break
+
             time.sleep(0.5)
-            logger.info(f"Fetching tracks, page {page + 1}")
+            logger.info("Fetching tracks, page %d", page + 1)
 
             # 1. Retrieve track list
             try:
                 response = web_request(self._build_page_url(page))
             except Exception as e:
-                logger.warning("Error fetching tracks. Exiting...")
-                raise Exception(f"Error fetching tracks: {e}")
+                logger.warning("Error fetching tracks: %s", e)
+                raise Exception(f"Error fetching tracks: {e}") from e
 
             soup_track_list = BeautifulSoup(response.content, "html.parser")
             track_list = soup_track_list.select(".htx-topic-row")
 
             if not track_list:
-                logger.warning(f"No track rows found on page {page + 1}. Stopping.")
+                logger.warning("No track rows found on page %d. Stopping.", page + 1)
                 break
 
             # 2. Parse track list (results are sorted by release date,
-            #    newest first). If any row on this page fell outside the
-            #    from_date window, deeper pages only contain older tracks.
-            tracks: List[TrackData] = self._extract_tracks_out_of_list(track_list)
+            #    newest first). Stop paging only when a parsed row's date
+            #    actually fell outside the from_date window or the site has
+            #    no more rows; skipped/malformed rows must never cut the
+            #    window short.
+            tracks, reached_cutoff = self._extract_tracks_out_of_list(track_list)
             track_data.extend(tracks)
 
-            if len(tracks) < len(track_list):
+            if reached_cutoff:
                 break
 
         # 3. Remove duplicate tracks
         track_data = list(set(track_data))
 
-        logger.info(f"Fetched a total of {len(track_data)} entries from hardtraxx.com")
+        logger.info("Fetched a total of %d entries from hardtraxx.com", len(track_data))
 
         return track_data
