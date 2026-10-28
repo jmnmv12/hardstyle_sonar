@@ -203,14 +203,18 @@ class SpotifyAPI(BasePlaylistService):
             "Content-Type": "application/json",
         }
 
-        req_body = {"uris": ["2jE9r0cUSWoOkFWrDQVU3d"], "position": 0}
-        print(req_body)
+        req_body = {"uris": _build_payload(tracks), "position": 0}
+        logger.info(f"Adding tracks to Spotify playlist: {req_body}")
         tracks_response = requests.post(
             f"https://api.spotify.com/v1/playlists/{self.playlist_id}/tracks",
             json=req_body,
             headers=user_headers,
         )
-        print(tracks_response.json())
+        if not tracks_response.ok:
+            logger.warning(
+                f"Error adding tracks to Spotify playlist: "
+                f"HTTP {tracks_response.status_code} {tracks_response.text}"
+            )
 
     def get_track(self, track_name: str, from_date: datetime = None):
         logger.info(f"Gathering track uri for {track_name}")
