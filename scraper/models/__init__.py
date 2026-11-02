@@ -1,1 +1,1 @@
-from scraper.models.track_data import TrackData
+from scraper.models.track_data import Genre, TrackData

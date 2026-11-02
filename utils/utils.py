@@ -35,13 +35,14 @@ def retry_with_backoff(tries=3, delay=1, backoff=2):
 
 
 @retry_with_backoff(tries=3, delay=1, backoff=2)
-def web_request(url: str) -> requests.Response:
+def web_request(url: str, headers: dict = None) -> requests.Response:
     """
     Make a web request to the given URL.
 
     :param url: URL to make the request to.
+    :param headers: Optional headers to send with the request.
     :return: Response object.
     """
     web = requests.Session()
-    response = web.get(url)
+    response = web.get(url, headers=headers)
     return response
