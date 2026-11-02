@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -167,3 +167,59 @@ def test_fetch_tracks_skips_rows_before_from_date(monkeypatch):
     tracks = scraper.fetch_tracks()
     assert len(tracks) == 1
     assert tracks[0].youtube_video_id == "yiNW06dBTAM"
+
+
+SAME_TITLE_LIST_PAGE_HTML = """
+<html><body>
+<dl class="row-item htx-topic-row">
+  <dt class="htx-topic-main">
+    <a class="topictitle" href="https://hardtraxx.com/livesets/set-a-t1.html"
+       title="Same Title Set">Same Title Set</a>
+    <span class="htx-genre-mark" title="Hardstyle">HS</span>
+    <time datetime="2026-11-02">2 Nov</time>
+  </dt>
+</dl>
+<dl class="row-item htx-topic-row">
+  <dt class="htx-topic-main">
+    <a class="topictitle" href="https://hardtraxx.com/livesets/set-b-t2.html"
+       title="Same Title Set">Same Title Set</a>
+    <span class="htx-genre-mark" title="Hardstyle">HS</span>
+    <time datetime="2026-11-02">2 Nov</time>
+  </dt>
+</dl>
+</body></html>
+"""
+
+
+def test_before_from_date_handles_timezone_aware_dates():
+    scraper = HardTraxx(from_date=datetime(2026, 10, 30))
+
+    # A timezone-aware date compared against a naive from_date must not
+    # raise a TypeError
+    assert (
+        scraper._before_from_date(datetime(2026, 10, 29, tzinfo=timezone.utc))
+        is True
+    )
+    assert (
+        scraper._before_from_date(datetime(2026, 11, 2, tzinfo=timezone.utc))
+        is False
+    )
+
+
+def test_fetch_tracks_keeps_same_title_with_distinct_youtube_ids(monkeypatch):
+    _fake_web_request(
+        monkeypatch,
+        {
+            "https://hardtraxx.com/livesets/?tab=event&playable=1": SAME_TITLE_LIST_PAGE_HTML,
+            "https://hardtraxx.com/livesets/set-a-t1.html": DETAIL_PAGE_WITH_YOUTUBE,
+            "https://hardtraxx.com/livesets/set-b-t2.html": DETAIL_PAGE_WITH_EMBED,
+        },
+    )
+
+    scraper = HardTraxx(from_date=datetime(2026, 10, 1))
+    tracks = scraper.fetch_tracks()
+
+    # Two livesets with the same title but different youtube videos
+    # must both be kept
+    assert len(tracks) == 2
+    assert {t.youtube_video_id for t in tracks} == {"yiNW06dBTAM", "A6X2B8F5QvI"}

@@ -1,5 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+import requests
+
+import playlist.youtube as playlist_youtube
 from playlist import YouTube
 from playlist.youtube import YouTubeItem
 
@@ -114,3 +118,107 @@ def test_default_retention_is_30_days():
 
     signature = inspect.signature(YouTube.sync_playlist)
     assert signature.parameters["retention_days"].default == 30
+
+
+class FakeAPIResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} Error")
+
+
+def test_add_playlist_items_skips_duplicate_error(monkeypatch):
+    youtube = _make_client()
+    # Prevent the client from trying to refresh its (absent) credentials
+    youtube._access_token = "test-token"
+
+    payload = {
+        "error": {
+            "code": 400,
+            "errors": [{"reason": "alreadyExistsInPlaylist"}],
+        }
+    }
+    monkeypatch.setattr(
+        playlist_youtube.requests,
+        "post",
+        lambda *args, **kwargs: FakeAPIResponse(400, payload),
+    )
+
+    # A duplicate/already-present error is swallowed
+    youtube.add_playlist_items([_playlist_item("dupe", None)])
+
+
+def test_add_playlist_items_raises_on_other_400_errors(monkeypatch):
+    youtube = _make_client()
+    # Prevent the client from trying to refresh its (absent) credentials
+    youtube._access_token = "test-token"
+
+    payload = {
+        "error": {
+            "code": 400,
+            "errors": [{"reason": "invalidResourceId"}],
+        }
+    }
+    monkeypatch.setattr(
+        playlist_youtube.requests,
+        "post",
+        lambda *args, **kwargs: FakeAPIResponse(400, payload),
+    )
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        youtube.add_playlist_items([_playlist_item("bad", None)])
+
+
+def test_get_playlist_includes_deleted_videos(monkeypatch):
+    youtube = _make_client()
+
+    results = {
+        "items": [
+            {
+                # Deleted/private entry: no videoId in contentDetails
+                "id": "PI_deleted",
+                "snippet": {"publishedAt": "2026-10-01T00:00:00Z"},
+                "contentDetails": {},
+            },
+            {
+                "id": "PI_live",
+                "snippet": {"publishedAt": "2026-10-02T00:00:00Z"},
+                "contentDetails": {"videoId": "abc12345678"},
+            },
+        ]
+    }
+    monkeypatch.setattr(youtube, "_get", lambda endpoint, params=None: results)
+
+    items = youtube.get_playlist()
+
+    assert [item.id for item in items] == ["PI_deleted", "abc12345678"]
+    assert items[0].playlist_item_id == "PI_deleted"
+    assert items[0].release_date == datetime(2026, 10, 1, tzinfo=timezone.utc)
+    assert items[1].playlist_item_id == "PI_live"
+
+
+def test_sync_removes_deleted_entries_after_retention():
+    youtube = _make_client()
+    now = datetime(2026, 11, 2, 12, 0, 0)
+
+    removed = []
+    youtube.add_playlist_items = lambda tracks: None
+    youtube.remove_playlist_items = lambda tracks: removed.extend(tracks)
+
+    # A deleted video, keyed on its playlist item id, must be aged out
+    # of the playlist once the retention period has passed
+    deleted = YouTubeItem(
+        id="PI_deleted",
+        release_date=(now - timedelta(days=45)).replace(tzinfo=timezone.utc),
+        playlist_item_id="PI_deleted",
+    )
+
+    youtube.sync_playlist([deleted], [], retention_days=30, now=now)
+
+    assert [item.id for item in removed] == ["PI_deleted"]

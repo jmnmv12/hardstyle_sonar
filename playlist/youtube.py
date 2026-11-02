@@ -14,6 +14,15 @@ load_dotenv()
 YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3"
 YOUTUBE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
+# YouTube API error reasons that indicate the video is already present
+# in the playlist. Only these errors may be silently skipped when a video
+# is added; every other error must be raised.
+DUPLICATE_PLAYLIST_ITEM_REASONS = {
+    "alreadyExistsInPlaylist",
+    "duplicatePlaylistItem",
+    "videoAlreadyInPlaylist",
+}
+
 
 class YouTubeItem(Item):
     """A playlist item that also keeps the YouTube playlist item id,
@@ -194,14 +203,26 @@ class YouTubeAPI(BasePlaylistService):
 
             for entry in results.get("items", []):
                 video_id = entry.get("contentDetails", {}).get("videoId")
+                snippet = entry.get("snippet", {})
+
                 if not video_id:
-                    # Deleted or private videos show up without a video id
+                    # Deleted or private videos show up without a video id.
+                    # Keep them (keyed on the playlist item id) so they can
+                    # still be aged out of the playlist after the retention
+                    # period.
+                    items.append(
+                        YouTubeItem(
+                            id=entry.get("id"),
+                            release_date=snippet.get("publishedAt"),
+                            playlist_item_id=entry.get("id"),
+                        )
+                    )
                     continue
 
                 items.append(
                     YouTubeItem(
                         id=video_id,
-                        release_date=entry.get("snippet", {}).get("publishedAt"),
+                        release_date=snippet.get("publishedAt"),
                         playlist_item_id=entry.get("id"),
                     )
                 )
@@ -213,6 +234,23 @@ class YouTubeAPI(BasePlaylistService):
         logger.info(f"Fetched {len(items)} items from playlist {self.playlist_id}")
 
         return items
+
+    @staticmethod
+    def _is_duplicate_playlist_error(response) -> bool:
+        """Whether the response is a YouTube API error that indicates the
+        video is already present in the playlist."""
+        if response.status_code not in (400, 409):
+            return False
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+
+        errors = payload.get("error", {}).get("errors", [])
+        reasons = {error.get("reason") for error in errors}
+
+        return bool(reasons & DUPLICATE_PLAYLIST_ITEM_REASONS)
 
     def add_playlist_items(self, tracks: list):
         for track in tracks:
@@ -229,10 +267,9 @@ class YouTubeAPI(BasePlaylistService):
                 headers=self._auth_headers(),
             )
 
-            if r.status_code in (400, 409):
-                # 409 usually means the video is already in the playlist
-                logger.warning(
-                    f"Could not add {track.id} to the playlist: {r.text}"
+            if self._is_duplicate_playlist_error(r):
+                logger.info(
+                    f"{track.id} is already in playlist {self.playlist_id}"
                 )
                 continue
 

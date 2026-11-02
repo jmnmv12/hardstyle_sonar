@@ -86,8 +86,12 @@ def sync_livesets():
     livesets = scraper.fetch_tracks()
 
     if not livesets:
-        logger.info("No livesets with a youtube video found")
-        return
+        # Do not return here: the playlist sync must still run so videos
+        # that have been in the playlist for at least 30 days are removed
+        logger.info(
+            "No livesets with a youtube video found, "
+            "continuing with playlist cleanup only"
+        )
 
     #
     # 3. Init Playlist Service

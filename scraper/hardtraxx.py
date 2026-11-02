@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from scraper import BaseScraper
 from typing import List
 from scraper.models import Genre, TrackData
-from datetime import datetime
+from datetime import datetime, timezone
 from utils.utils import web_request
 
 logger = logging.getLogger("hardstyle_watcher.scraper.hardtraxx")
@@ -38,9 +38,18 @@ class HardTraxx(BaseScraper):
         "hc": Genre.Hardcore,
     }
 
+    @staticmethod
+    def _to_naive_utc(value: datetime) -> datetime:
+        # Normalize a datetime to naive UTC so timezone-aware and naive
+        # values can be compared without raising a TypeError
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
     def _before_from_date(self, date_obj: datetime) -> bool:
-        # Check if the date is before from_date
-        return date_obj < self.from_date
+        # Check if the date is before from_date, normalizing both dates
+        # to the same timezone awareness before comparing
+        return self._to_naive_utc(date_obj) < self._to_naive_utc(self.from_date)
 
     @classmethod
     def _extract_youtube_video_id(cls, soup) -> str:
@@ -149,8 +158,14 @@ class HardTraxx(BaseScraper):
                 )
             )
 
-        # 4. Remove duplicate livesets
-        track_data = list(set(track_data))
+        # 4. Remove duplicate livesets, keyed on the youtube video id so
+        #    distinct livesets with the same title are all preserved
+        #    (TrackData equality only compares title and artist)
+        unique_tracks = {}
+        for track in track_data:
+            key = track.youtube_video_id or (track.title, track.artist_name)
+            unique_tracks[key] = track
+        track_data = list(unique_tracks.values())
 
         logger.info(
             f"Fetched a total of {len(track_data)} livesets from hardtraxx.com"
